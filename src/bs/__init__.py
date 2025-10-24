@@ -291,7 +291,113 @@ def _choose_anchors_MC_nd(
     anchors = idx[np.arange(m), k]
     return anchors.astype(int)
 
+# ========================= Soft anchor probabilities =========================
+def _soft_anchor_probs_nd(
+    X, Y, eps, lam=1.0, alpha=1.0, w_band=10, T=0.25, q_U=np.inf, eps_y0=0.0, p=1
+):
+    """
+    Tính p(i|j) = softmax(-cost/T) trong băng quanh phi_j và trả về:
+      - q: (n,) với q_i = sum_j b_j * p(i|j), b_j = 1/m (Y đều)
+      - term_y: kỳ vọng [(alpha*||X[i]-Y[j]|| + eps_y0)^p] theo p(i|j) và b_j
+    cost(i,j) = alpha*||X[i]-Y[j]|| + lam * U_q(i | phi_j)
+    """
+    X = np.asarray(X, float); Y = np.asarray(Y, float)
+    n, d = X.shape; m = Y.shape[0]
+    assert m >= 1 and n >= 1
+    phi = _phi_j_to_ix_vectorized(n, m)
+    W = int(2 * w_band + 1)
 
+    base = np.arange(-w_band, w_band + 1, dtype=int)[None, :] + phi[:, None]  # (m, W)
+    idx = np.clip(base, 0, n - 1)
+    valid = (base >= 0) & (base <= (n - 1))
+
+    # biên để tính bottleneck U(i | phi_j)
+    l = np.minimum(idx, phi[:, None])
+    r = np.maximum(idx, phi[:, None]) - 1
+
+    if np.isinf(q_U):
+        st, lg = _rmq_build_max(eps)
+        U = lam * _rmq_query_max_batch(st, lg, l.ravel(), r.ravel()).reshape(m, W)
+    else:
+        pref = _build_prefix_pow_eps(eps, q_U)
+        U = lam * _range_pnorm_from_prefix(pref, l.ravel(), r.ravel(), q_U).reshape(m, W)
+
+    Xi = X[idx]  # (m, W, d)
+    dist = np.linalg.norm(Xi - Y[:, None, :], axis=2)  # (m, W)
+
+    cost = alpha * dist + U
+    logits = -cost / float(T)
+    logits = np.where(valid, logits, -np.inf)
+
+    z = logits - np.nanmax(logits, axis=1, keepdims=True)
+    expz = np.exp(z, where=np.isfinite(z), out=np.zeros_like(z))
+    expz *= valid
+    sums = expz.sum(axis=1, keepdims=True)
+
+    # fallback: hàng không hợp lệ -> one-hot tại MAP trong băng
+    best_k_map = np.argmin(np.where(valid, cost, np.inf), axis=1)
+    probs = np.divide(expz, sums, out=np.zeros_like(expz), where=(sums > 0))
+    empty = (sums.ravel() == 0)
+    if np.any(empty):
+        probs[empty, :] = 0.0
+        probs[empty, best_k_map[empty]] = 1.0
+
+    # q_i = (1/m) * sum_j p(i|j)
+    q = np.zeros(n, dtype=float)
+    weights = (1.0 / float(m)) * probs  # (m, W)
+    np.add.at(q, idx, weights)
+
+    # term_y = E_{j~b, i~p(.|j)} [ (alpha*||X[i]-Y[j]|| + eps_y0)^p ]
+    pw = float(p)
+    term_y = np.sum(weights * (alpha * dist + float(eps_y0)) ** pw, dtype=float)
+
+    return q, term_y
+
+
+# ====== Tree part (no-attach) từ q: W_p^p(tree) = sum_e (w[e]^p) * |mass_e| ======
+def _wp_pow_tree_from_q(tree_x: _Tree, a, q, p=1):
+    """
+    Đồng bộ với định nghĩa hiện tại trong _wp_pow_no_attach_nd:
+    dùng w[v]**p * |mass[v]| (không đổi công thức cũ để nhất quán MAP/MC).
+    mass_leaf = a - q, dồn bottom-up.
+    """
+    pw = float(p)
+    parent = tree_x.parent
+    w = tree_x.w
+    n_nodes = parent.size
+
+    mass = np.zeros(n_nodes, dtype=float)
+    mass[tree_x.leaf_x] = a - q  # (n,)
+
+    total = 0.0
+    for v in range(n_nodes - 1, 0, -1):
+        pv = parent[v]
+        if pv >= 0:
+            total += (w[v] ** pw) * abs(mass[v])
+            mass[pv] += mass[v]
+    return float(total)
+
+def _wp_pow_tree_from_q(tree_x: _Tree, a, q, p=1):
+    """
+    Đồng bộ với định nghĩa hiện tại trong _wp_pow_no_attach_nd:
+    dùng w[v]**p * |mass[v]| (không đổi công thức cũ để nhất quán MAP/MC).
+    mass_leaf = a - q, dồn bottom-up.
+    """
+    pw = float(p)
+    parent = tree_x.parent
+    w = tree_x.w
+    n_nodes = parent.size
+
+    mass = np.zeros(n_nodes, dtype=float)
+    mass[tree_x.leaf_x] = a - q  # (n,)
+
+    total = 0.0
+    for v in range(n_nodes - 1, 0, -1):
+        pv = parent[v]
+        if pv >= 0:
+            total += (w[v] ** pw) * abs(mass[v])
+            mass[pv] += mass[v]
+    return float(total)
 # ========================= OT on Tree: no-attach =========================
 def _wp_pow_no_attach_nd(tree_x: _Tree, anchors, X, Y, a, b, alpha=1.0, eps_y0=0.0, p=1):
     """
@@ -329,7 +435,7 @@ def bbs_tree_ot_distance_nd(
     alpha=1.0,
     lam=5.0,
     eps0=0.0, eps1=1.0, p_eps=1,
-    anchor_mode="MC",         # "MC" hoặc "MAP"
+    anchor_mode="MC",         # "MC", "MAP", hoặc "SOFT"
     w_band=10,
     T_mc=0.25,
     eps_y0=0.0,
@@ -337,11 +443,10 @@ def bbs_tree_ot_distance_nd(
     random_state=None,
     reducer="mean",           # "mean" hoặc "median"
     return_details=False,
-    q_U=np.inf,               # <--- NEW: q-norm cho U (np.inf => max)
+    q_U=np.inf,               # q-norm cho U (np.inf => max)
 ):
     """
-    Khoảng cách BBS (backbone–bottleneck–softmin) giữa 2 chuỗi đa chiều X,Y.
-    Mọi nơi đều dùng norm véc-tơ theo D, không flatten.
+    Khoảng cách BBS giữa 2 chuỗi đa chiều X,Y.
     Trả về W_p (không phải W_p^p).
     """
     rng = np.random.default_rng(random_state)
@@ -366,17 +471,35 @@ def bbs_tree_ot_distance_nd(
     b = np.full(m, 1.0 / m)
 
     def _calc_once(local_rng):
-        if anchor_mode.upper() == "MAP":
+        mode = anchor_mode.upper()
+        if mode == "MAP":
             anchors = _choose_anchors_MAP_nd(X, Y, eps, lam=lam, alpha=alpha, w_band=w_band, q_U=q_U)
-        elif anchor_mode.upper() == "MC":
-            anchors = _choose_anchors_MC_nd(X, Y, eps, lam=lam, alpha=alpha, w_band=w_band, T=T_mc, rng=local_rng, q_U=q_U)
-        else:
-            raise ValueError("anchor_mode phải là 'MAP' hoặc 'MC'.")
-        w_p_p = _wp_pow_no_attach_nd(tree_x, anchors, X, Y, a, b,
-                                     alpha=alpha, eps_y0=eps_y0, p=p_ot)
-        return (w_p_p ** (1.0 / p_ot)) if p_ot != 1 else w_p_p, anchors
+            w_p_p = _wp_pow_no_attach_nd(tree_x, anchors, X, Y, a, b,
+                                         alpha=alpha, eps_y0=eps_y0, p=p_ot)
+            return (w_p_p ** (1.0 / p_ot)) if p_ot != 1 else w_p_p, anchors
 
-    if anchor_mode.upper() == "MAP":
+        elif mode == "MC":
+            anchors = _choose_anchors_MC_nd(X, Y, eps, lam=lam, alpha=alpha, w_band=w_band,
+                                            T=T_mc, rng=local_rng, q_U=q_U)
+            w_p_p = _wp_pow_no_attach_nd(tree_x, anchors, X, Y, a, b,
+                                         alpha=alpha, eps_y0=eps_y0, p=p_ot)
+            return (w_p_p ** (1.0 / p_ot)) if p_ot != 1 else w_p_p, anchors
+
+        elif mode == "SOFT":
+            # Neo mềm: p(i|j) -> q_i, cộng với kỳ vọng term_y; phần cây lấy từ q
+            q, term_y = _soft_anchor_probs_nd(
+                X, Y, eps, lam=lam, alpha=alpha, w_band=w_band,
+                T=T_mc, q_U=q_U, eps_y0=eps_y0, p=p_ot
+            )
+            tree_part = _wp_pow_tree_from_q(tree_x, a, q, p=p_ot)
+            w_p_p = term_y + tree_part
+            return (w_p_p ** (1.0 / p_ot)) if p_ot != 1 else w_p_p, None
+
+        else:
+            raise ValueError("anchor_mode phải là 'MAP', 'MC' hoặc 'SOFT'.")
+
+    mode = anchor_mode.upper()
+    if mode in ("MAP", "SOFT"):
         val, anchors = _calc_once(rng)
         if not return_details:
             return float(val)
@@ -388,6 +511,7 @@ def bbs_tree_ot_distance_nd(
                            reducer=reducer, q_U=q_U)
         }
 
+    # MC: lặp num_samples
     vals = []
     anchors_list = [] if return_details else None
     for _ in range(int(num_samples)):
@@ -407,6 +531,7 @@ def bbs_tree_ot_distance_nd(
                        anchor_mode=anchor_mode, w_band=w_band, T_mc=T_mc, eps_y0=eps_y0, p_ot=p_ot,
                        reducer=reducer, q_U=q_U)
     }
+
 # ============================== Arclength utils ===============================
 def _resample_by_arclength(X, n_new=None):
     """

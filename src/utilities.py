@@ -151,6 +151,10 @@ def run_knn(datapath, datatype, alg,
         for i in tqdm(range(test_len), desc="Test batches"):
             for j in range(train_len):
                 X_test_computed[i, j] = 1/2*(bs_distance_between_series(X_test[i], X_train[j], anchor_mode="MC", num_trees=8) + bs_distance_between_series(X_train[j], X_test[i], anchor_mode="MC", num_trees=8))
+    elif alg == "BS_SOFT":
+        for i in tqdm(range(test_len), desc="Test batches"):
+            for j in range(train_len):
+                X_test_computed[i, j] = 1/2*(bs_distance_between_series(X_test[i], X_train[j], anchor_mode="SOFT", num_trees=1) + bs_distance_between_series(X_train[j], X_test[i], anchor_mode="SOFT", num_trees=8))
     else:
         raise ValueError(f"Unknown alg: {alg}")
 
