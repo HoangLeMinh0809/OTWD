@@ -123,7 +123,7 @@ def run_knn(datapath, datatype, alg,
             lam_time=5.0,     # hệ số lambda cho (i/n - j/m)^2 (ẩn trong augment)
             leaf_size=16, max_depth=20,
             seed=0,
-            k_split= M.shape[1],        # split into n clusters, where n is the number of elements per series
+            k_split= 2,        # split into n clusters, where n is the number of elements per series
             box_leaf_size=64, box_max_depth=24
         )
 

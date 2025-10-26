@@ -18,8 +18,40 @@ def _linearize_points(M: np.ndarray):
     return P, Sidx, Tidx, (m_seq, n, d)
 
 def _pairwise_sqdist(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    aa = (A*A).sum(1)[:, None]; bb = (B*B).sum(1)[None, :]
-    return np.clip(aa + bb - 2*A@B.T, 0.0, None)
+    """
+    Trả về 'khoảng cách' dạng:
+      Euclid^2 trên các đặc trưng (trừ cột cuối)  +  |orderA - orderB|
+
+    - Cột cuối cùng của A, B là 'order feature' đã nhúng lambda (λ) sẵn.
+    - Không cộng order vào phần Euclid; order chỉ là phạt tuyệt đối riêng.
+    - Nếu A/B chỉ có 1 cột (chỉ order), kết quả là |orderA - orderB|.
+    """
+    assert A.ndim == 2 and B.ndim == 2, "Expect 2D arrays"
+    assert A.shape[1] == B.shape[1], "Dim mismatch"
+
+    D = A.shape[1]
+    if D == 0:
+        return np.zeros((A.shape[0], B.shape[0]), dtype=float)
+
+    if D == 1:
+        # Chỉ có order → khoảng cách = phạt tuyệt đối giữa order
+        a_ord = A[:, 0]
+        b_ord = B[:, 0]
+        return np.abs(a_ord[:, None] - b_ord[None, :])
+
+    # Phần đặc trưng: dùng tất cả cột trừ cột cuối
+    Af = A[:, :-1]
+    Bf = B[:, :-1]
+    aa = (Af * Af).sum(1)[:, None]
+    bb = (Bf * Bf).sum(1)[None, :]
+    Dsq = np.clip(aa + bb - 2 * (Af @ Bf.T), 0.0, None)
+
+    # Phần order (cột cuối): phạt tuyệt đối, KHÔNG bình phương, KHÔNG thêm lambda
+    a_ord = A[:, -1]
+    b_ord = B[:, -1]
+    Pen = np.abs(a_ord[:, None] - b_ord[None, :])
+
+    return Dsq + Pen
 
 @dataclass
 class _Node:
