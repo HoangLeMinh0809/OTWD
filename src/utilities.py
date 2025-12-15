@@ -113,25 +113,37 @@ def run_knn(datapath, datatype, alg,
                 X_test_computed[i, j] = gow_sinkhorn_autoscale([], [], C)
     
     elif alg == "CTWD-TamLe":
-    # 1) Prepare M with proper shape (m = test_len + train_len, n, d)
-        sequences = [X_test[i] for i in range(test_len)] + [X_train[j] for j in range(train_len)]
-        M = np.asarray(sequences, dtype=float)
+        # 1) Gom chuỗi theo đúng thứ tự: test trước, rồi train (m = test_len + train_len)
+        sequences = [np.asarray(X_test[i],  dtype=float) for i in range(test_len)] + \
+                    [np.asarray(X_train[j], dtype=float) for j in range(train_len)]
 
-    # 2) Build CTWD model (one-time)
+        # (tuỳ chọn) sanity check: tất cả chuỗi phải 2D và cùng số kênh d
+        d = sequences[0].shape[1]
+        assert all(x.ndim == 2 and x.shape[1] == d for x in sequences), "Mỗi chuỗi phải có shape (n_i, d) và cùng d."
+
+        # 2) Build CTWD model (một lần)
         model_ctwd = build_ctwd_tamle(
-            M,
-            lam_time=5.0,     # hệ số lambda cho (i/n - j/m)^2 (ẩn trong augment)
+            sequences,
+            lam_time=5.0,
             leaf_size=16, max_depth=20,
             seed=0,
-            k_split= 2,        # split into n clusters, where n is the number of elements per series
+            k_split=2,
             box_leaf_size=64, box_max_depth=24
         )
 
-    # 3) Compute distance between each pair of sequences
-        for i in tqdm(range(test_len), desc="CTWD-TamLe | test rows"):
-            for j in range(train_len):
-                dist_w1 = ctwd_between_series(model_ctwd, s_ref=i, s_cmp=test_len + j, p=1)
-                X_test_computed[i, j] = dist_w1
+        # 3) Tính distance test-vs-train:
+        #    dùng cache M (E x m) và w (E,) để tính nhanh:  dist(i, :) = sum_e w_e * |M[e,i] - M[e,:]|
+        m_total = test_len + train_len
+        M_edge_mass = model_ctwd.M          # (E, m_total)
+        w = model_ctwd.w.reshape(-1, 1)     # (E, 1)
+
+        for i in range(test_len):
+            # vector hoá: khoảng cách từ chuỗi i (test) đến tất cả chuỗi
+            # abs(M[:, i:i+1] - M) -> (E, m_total), nhân w rồi sum theo E
+            dist_all = (w * np.abs(M_edge_mass[:, i:i+1] - M_edge_mass)).sum(axis=0)  # (m_total,)
+            # chỉ lấy block test-vs-train
+            X_test_computed[i, :] = dist_all[test_len : test_len + train_len]
+
 
 
     elif alg == "DTW":

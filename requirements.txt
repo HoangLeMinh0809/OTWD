@@ -6,3 +6,4 @@ POT==0.8.2
 scikit_learn==1.1.2
 seaborn==0.13.2
 tslearn==0.6.4
+scikit_learn_extra==0.3.0
