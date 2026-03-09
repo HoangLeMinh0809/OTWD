@@ -1,14 +1,14 @@
-# Ordered Tree-Wasserstein Distance (OTWD)
+# Ordered Tree Sliced Wasserstein (OTSW)
 
 This project implements multiple methods for measuring similarity between temporal sequences using various Optimal Transport-based distances, including Tree-Wasserstein Distance and other state-of-the-art approaches.
 
 ## Project Overview
 
-OTWD provides comprehensive tools for analyzing and comparing temporal sequences using advanced mathematical techniques combining optimal transport theory and dynamic programming. The project includes implementations of various distance algorithms for time series analysis, clustering, and pattern recognition.
+OTSW provides comprehensive tools for analyzing and comparing temporal sequences using advanced mathematical techniques combining optimal transport theory and dynamic programming. The project includes implementations of various distance algorithms for time series analysis, clustering, and pattern recognition.
 
 ### Implemented Distance Methods
 
-- **CTWD (Ordered Tree Sliced Wasserstein)** - Tree-based optimal transport with temporal constraints
+- **OTSW (Ordered Tree Sliced Wasserstein)** - Tree-based optimal transport with temporal constraints
 - **ASW (Auto-weighted Sequential Wasserstein)** - Automatically balanced multi-component distance
 - **TAOT (Time-Adaptive Optimal Transport)** - Time-aware OT with entropic regularization
 - **POW (Partial Ordered Wasserstein)** - Bandwidth-constrained temporal matching
@@ -44,7 +44,7 @@ OTWD provides comprehensive tools for analyzing and comparing temporal sequences
     ├── gow/                   # Generalized Ordered Wasserstein
     │   ├── __init__.py
     │   └── utilities.py
-    └── otwd_star/             # CTWD implementation
+    └── otsw/                  # OTSW implementation
         └── __init__.py
 ```
 
@@ -103,7 +103,7 @@ Run clustering experiments using [experiment/kmedoids.ipynb](experiment/kmedoids
 2. Run all cells to define functions
 3. In **Cell 9**, change the `ALG` variable:
    ```python
-   ALG = "CTWD"  # Options: "CTWD", "OPW", "TCOT", "POW", "ASW", "TAOT"
+   ALG = "OTSW"  # Options: "OTSW", "OPW", "TCOT", "POW", "ASW", "TAOT"
    ```
 4. Execute the cell to run clustering and save results to CSV
 
@@ -124,17 +124,17 @@ run_knn('Weizmann', datatype, alg)
 
 ## Usage Examples
 
-### Using CTWD (Tree-based Distance)
+### Using OTSW (Tree-based Distance)
 
 ```python
-from src.otwd_star import build_ctwd_tamle, ctwd_between_series_fast
+from src.otsw import build_otsw_tamle, otsw_between_series_fast
 import numpy as np
 
 # Prepare sequences (list of arrays or 3D array)
 sequences = [np.random.randn(50, 3), np.random.randn(60, 3)]
 
-# Build CTWD model
-model = build_ctwd_tamle(
+# Build OTSW model
+model = build_otsw_tamle(
     sequences,
     lam_time=5.0,      # Time regularization
     leaf_size=16,      # Tree leaf size
@@ -143,8 +143,8 @@ model = build_ctwd_tamle(
 )
 
 # Compute distance between series 0 and 1
-distance = ctwd_between_series_fast(model, 0, 1)
-print(f"CTWD distance: {distance}")
+distance = otsw_between_series_fast(model, 0, 1)
+print(f"OTSW distance: {distance}")
 ```
 
 ### Using ASW/TAOT/TCOT Distances
@@ -182,7 +182,7 @@ X_tr, y_tr, X_te, y_te = load_human_action_dataset(
 
 | Method | Description | GPU Support | Key Parameters |
 |--------|-------------|-------------|----------------|
-| **CTWD** | Tree-based OT with temporal ordering | ❌ | `lam_time`, `leaf_size`, `max_depth` |
+| **OTSW** | Tree-based OT with temporal ordering | ❌ | `lam_time`, `leaf_size`, `max_depth` |
 | **ASW** | Auto-weighted spatial + order + structure | ✅ | `lam`, `auto_weight` |
 | **TAOT** | Time-adaptive OT with entropic reg. | ✅ | `lam`, `w` (time weight) |
 | **POW** | Partial OT with bandwidth constraint | ✅ | `lam`, `bandwidth`, `lam_order` |
@@ -193,11 +193,11 @@ X_tr, y_tr, X_te, y_te = load_human_action_dataset(
 
 ### Method Recommendations
 
-- **For ragged/variable-length sequences**: CTWD, ASW, TAOT, POW, TCOT
+- **For ragged/variable-length sequences**: OTSW, ASW, TAOT, POW, TCOT
 - **For GPU acceleration**: OPW (required), ASW, TAOT, POW, TCOT (optional)
-- **For clustering**: CTWD, ASW (best balance of accuracy and speed)
-- **For interpretability**: DTW (classic), CTWD (tree structure)
-- **For large-scale datasets**: OPW (GPU), CTWD (efficient tree-based)
+- **For clustering**: OTSW, ASW (best balance of accuracy and speed)
+- **For interpretability**: DTW (classic), OTSW (tree structure)
+- **For large-scale datasets**: OPW (GPU), OTSW (efficient tree-based)
 
 ## Notebooks and Experiments
 
@@ -243,7 +243,7 @@ Located in `data/Human_Actions/`:
    pip install cupy-cuda11x
    ```
 
-2. **CTWD Parameters**:
+2. **OTSW Parameters**:
    - Decrease `leaf_size` (4-16) for better accuracy, increase for speed
    - Increase `lam_time` (5-20) for stronger temporal alignment
    - Adjust `max_depth` based on dataset size

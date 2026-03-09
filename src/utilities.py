@@ -1,361 +1,373 @@
-import os
-from os.path import basename, join
-import sys
-import time
 
-import joblib
-import numpy as np
-import ot
-import pandas as pd
+# ============================================================
+# ABLATION STUDY FOR OTSW PARAMETERS (k-NN Accuracy & MAP)
+# ============================================================
+"""
+Ablation Study for OTSW Hyperparameters
+=======================================
 
-from sklearn import neighbors
-from sklearn.metrics import accuracy_score, average_precision_score
-from tqdm import tqdm
+This section performs ablation study on OTSW hyperparameters measuring k-NN performance:
+- Lambda (lam_time): (0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100)
+- Max Depth: (5, 10, 15, 20, 25, 30)
+- Number of Trees: (1, 3, 5, 7, 9, 11, 13, 15)
+- Number of Clusters (k_split): (2, 4, 8, 16, 32)
 
-# để import các hàm distance khác nếu bạn đặt trong src/
-sys.path.append('src')
-# from your_module import dtw_distance_series, taot_distance, gow_sinkhorn_autoscale
-import cupy as cp
+Default values: lambda=5, depth=30, trees=5, num_cluster=2
 
-# =========================
-#  Loader UCR từ tslearn
-# =========================
-def load_ucr_dataset_tsl(data_dir, dataset_name):
+When varying one parameter, all others are fixed at default values.
+Results include Accuracy, MAP, and execution time for each configuration.
+"""
+
+import matplotlib.pyplot as plt
+
+# ---------------------- Configuration ----------------------
+# Default parameter values
+ABLATION_DEFAULT_LAMBDA = 5
+ABLATION_DEFAULT_DEPTH = 30
+ABLATION_DEFAULT_TREES = 5
+ABLATION_DEFAULT_NUM_CLUSTER = 2  # k_split
+
+# Parameter ranges for ablation
+ABLATION_LAMBDA_VALUES = [v**2 for v in [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 1000, 10000]]
+# [1e-06, 2.5e-05, 0.0001, 0.0025, 0.01, 0.25, 1, 25, 100, 2500, 10000, 1000000, 100000000]
+ABLATION_DEPTH_VALUES = [5, 10, 15, 20, 25, 30]
+ABLATION_TREES_VALUES = [1, 3, 5, 7, 9, 11, 13, 15]
+ABLATION_NUM_CLUSTER_VALUES = [2, 4, 8, 16, 32, 128]
+
+# Dataset configuration
+ABLATION_DATASET = "BasicMotions"
+ABLATION_DATATYPE = "UCR_TSL"
+ABLATION_LEAF_SIZE = 16
+ABLATION_BASE_SEED = 0
+ABLATION_K_NN = 1  # k for k-NN
+
+
+def run_knn_ablation_single(
+    X_train, y_train, X_test, y_test,
+    lam_time=ABLATION_DEFAULT_LAMBDA,
+    max_depth=ABLATION_DEFAULT_DEPTH,
+    num_trees=ABLATION_DEFAULT_TREES,
+    k_split=ABLATION_DEFAULT_NUM_CLUSTER,
+    leaf_size=ABLATION_LEAF_SIZE,
+    seed=ABLATION_BASE_SEED,
+    k_nn=ABLATION_K_NN,
+):
     """
-    Loads train and test data using tslearn's UCR/UEA loader.
-    data_dir hiện không sử dụng nhưng giữ lại cho tương thích.
+    Run k-NN with OTSW for a single parameter configuration.
+    Returns: (Accuracy, MAP, time_total)
     """
-    from tslearn.datasets import UCR_UEA_datasets
-    X_train, y_train, X_test, y_test = UCR_UEA_datasets().load_dataset(dataset_name)
-
-    print("Successfully loaded dataset:", dataset_name)
-    print("Size of train data:", len(y_train))
-    print("Size of test data:", len(y_test))
-
-    return X_train, y_train, X_test, y_test
-
-
-# =========================
-#  Tính MAP đúng kiểu paper
-# =========================
-def compute_map_knn_precomputed(X_computed, X_test_computed,
-                                y_train, y_test, k=1):
-    """
-    Tính MAP cho k-NN (metric='precomputed') theo mô tả trong paper:
-
-      - Fit k-NN với số láng giềng k.
-      - predict_proba trên test -> score cho từng lớp.
-      - Với mỗi lớp c:
-          AP_c = average_precision_score(1_{y_test==c}, score_c)
-      - MAP = trung bình AP_c trên tất cả các lớp.
-
-    Trả về MAP dạng phần trăm [%].
-    """
-    clf = neighbors.KNeighborsClassifier(
-        n_neighbors=k,
-        metric="precomputed",
-        weights="uniform",
-    )
-    clf.fit(X_computed, y_train)
-
-    proba = clf.predict_proba(X_test_computed)   # shape (n_test, n_classes)
-    classes = clf.classes_
-
-    aps = []
-    for c_idx, c in enumerate(classes):
-        y_true_c = (y_test == c).astype(int)
-        if np.sum(y_true_c) == 0:
-            # không có sample lớp c trong test -> bỏ qua
-            continue
-
-        y_score_c = proba[:, c_idx]
-
-        # Nếu mọi score y hệt nhau thì PR curve thoái hoá, coi AP = 0
-        if np.all(y_score_c == y_score_c[0]):
-            aps.append(0.0)
-        else:
-            ap_c = average_precision_score(y_true_c, y_score_c)
-            aps.append(ap_c)
-
-    if len(aps) == 0:
-        return 0.0
-
-    return float(np.mean(aps) * 100.0)
-
-
-# =========================
-#  Hàm chính run_knn (nhiều lần)
-# =========================
-def run_knn(datapath, datatype, alg,
-            normalize_cost_matrix=True,
-            cost_metric="minkowski",
-            num_neighbor_list=[1, 3, 5, 10, 15, 30],
-            num_runs=5):
-    """
-    Run k-NN với precomputed distances, lặp nhiều lần:
-
-      - Mỗi lần:
-          + Tính ma trận khoảng cách train–train, test–train.
-          + Chạy k-NN với nhiều k, lấy best accuracy (theo k).
-          + Tính MAP (dùng k = best_k hoặc k cố định tuỳ chọn).
-      - Sau num_runs lần:
-          + Lấy mean và variance cho:
-                accuracy, map, runtime.
-
-    Ghi vào Excel với các cột:
-      dataset, accuracy_mean, accuracy_var, map_mean, map_var,
-      runtime_mean, runtime_var
-    """
-    # 1. Load dữ liệu (chỉ 1 lần)
-    if datatype == "UCR_TSL":
-        X_train, y_train, X_test, y_test = load_ucr_dataset_tsl("../data/UCR", datapath)
-    else:
-        raise ValueError(f"Unknown datatype: {datatype}")
-
-    # Downsample CinCECGTorso và MixedShapesSmallTrain xuống 300 mẫu
-    if datapath in ["CinCECGTorso", "MixedShapesSmallTrain"]:
-        X_all = np.concatenate([X_train, X_test], axis=0)
-        y_all = np.concatenate([y_train, y_test], axis=0)
-        
-        if len(X_all) > 300:
-            rng = np.random.default_rng(0)
-            idx = rng.choice(len(X_all), size=300, replace=False)
-            X_all = X_all[idx]
-            y_all = y_all[idx]
-            print(f"[DOWNSAMPLE] {datapath}: {len(X_train)+len(X_test)} → 300 samples")
-        
-        # Chia lại train/test 70/30
-        n_train = int(0.7 * len(X_all))
-        X_train, y_train = X_all[:n_train], y_all[:n_train]
-        X_test, y_test = X_all[n_train:], y_all[n_train:]
-
+    start_time = time.time()
+    
     train_len = len(y_train)
     test_len = len(y_test)
-
-    # Danh sách để gom kết quả của nhiều lần chạy
-    acc_list = []
-    map_list = []
-    time_list = []
-
-    # ====== Lặp nhiều lần ======
-    for run_idx in range(num_runs):
-        print(f"\n========== Run {run_idx + 1}/{num_runs} for {alg} on {datapath} ==========")
-        t0 = time.time()
-
-        # 2. Khởi tạo ma trận khoảng cách cho lần chạy này
-        X_computed = np.zeros((train_len, train_len), dtype=float)      # train–train
-        X_test_computed = np.empty((test_len, train_len), dtype=float)  # test–train
+    
+    # Build sequences: test first, then train
+    sequences = [np.asarray(X_test[i], dtype=float) for i in range(test_len)] + \
+                [np.asarray(X_train[j], dtype=float) for j in range(train_len)]
+    
+    # Build OTSW model with multiple trees and average
+    dist_accumulator = np.zeros((test_len, train_len), dtype=float)
+    train_dist_accumulator = np.zeros((train_len, train_len), dtype=float)
+    
+    for t in range(num_trees):
+        current_seed = seed + t
         
-           
-        # 2) Build CTWD model (một lần)
-        if alg == "CTWD":
-            # 1) Gom chuỗi theo đúng thứ tự: test trước, rồi train (m = test_len + train_len)
-            sequences = [np.asarray(X_test[i],  dtype=float) for i in range(test_len)] + \
-                        [np.asarray(X_train[j], dtype=float) for j in range(train_len)]
-    
-            # (tuỳ chọn) sanity check: tất cả chuỗi phải 2D và cùng số kênh d
-            d = sequences[0].shape[1]
-            assert all(x.ndim == 2 and x.shape[1] == d for x in sequences), "Mỗi chuỗi phải có shape (n_i, d) và cùng d."
-    
-            # 2) Build CTWD model (một lần)
-            # Cấu hình số lượng cây
-            n_trees = 5
-            
-            # Khởi tạo ma trận kết quả tích lũy (Accumulator)
-            # X_test_computed cần được khởi tạo bằng 0 để cộng dồn
-            # Giả sử shape là (test_len, train_len) như logic cũ
-            dist_accumulator = np.zeros((test_len, train_len), dtype=float)
-
-            for t in range(n_trees):
-                # QUAN TRỌNG: Thay đổi seed cho mỗi cây để tạo sự đa dạng (diversity)
-                # Nếu giữ nguyên seed, 5 cây sẽ y hệt nhau -> trung bình vô nghĩa.
-                current_seed = (run_idx * 100) + t 
-
-                # 2) Build CTWD model (cho cây thứ t)
-                model_ctwd = build_ctwd_tamle(
-                    sequences,
-                    lam_time=5.0,       # User parameter
-                    leaf_size=16,       # User parameter
-                    max_depth=20,       # User parameter
-                    seed=current_seed,  # Seed thay đổi theo t
-                    k_split=2,          # User parameter
-                    box_leaf_size=64,   # User parameter
-                    box_max_depth=24    # User parameter
-                )
-
-                # 3) Tính distance test-vs-train cho cây t:
-                m_total = test_len + train_len
-                M_edge_mass = model_ctwd.M          # (E, m_total)
-                w = model_ctwd.w.reshape(-1, 1)     # (E, 1)
-
-                for i in range(test_len):
-                    # Vector hoá: khoảng cách từ chuỗi i (test) đến tất cả chuỗi
-                    dist_all = (w * np.abs(M_edge_mass[:, i:i+1] - M_edge_mass)).sum(axis=0)
-                    
-                    # Cộng dồn vào kết quả tổng (chỉ lấy phần train)
-                    dist_accumulator[i, :] += dist_all[test_len : test_len + train_len]
-
-            # 4) Lấy trung bình
-            X_test_computed = dist_accumulator / n_trees
-    
-        else:
-            # 3. Hàm nội bộ tính distance cho một cặp chuỗi
-            def _pair_distance(x, y):
-                if alg == "DTW":
-                    return dtw_distance_series(x, y)
-                elif alg == "TAOT":
-                    return taot_distance(x, y)
-                elif alg == "GOW":
-                    C = ot.dist(x, y, metric=cost_metric)
-                    if normalize_cost_matrix:
-                        maxC = C.max()
-                        if maxC > 0:
-                            C = C / maxC
-                    return gow_sinkhorn_autoscale([], [], C)
-                elif alg == "POW":
-                    return pow_distance(x, y)
-                elif alg == "ASW":
-                    return asw_distance(x, y, lam=10.0, auto_weight=True)
-                elif alg == "TCOT":
-                    x_gpu = (x)
-                    y_gpu = (y)
-                    return tcot_distance_series(x_gpu, y_gpu)
-                elif alg == "OPW":
-                    x_gpu = cp.asarray(x, dtype=cp.float64)
-                    y_gpu = cp.asarray(y, dtype=cp.float64)
-                    return opw_distance_series_gpu(
-                        x_gpu, y_gpu,
-                        lambda1=1.0,
-                        lambda2=0.1,
-                        sigma=0.05
-                    )
-
-                else:
-                    raise ValueError(f"Unknown alg: {alg}")
-
-            # 4. Tính train–train distance (dùng đối xứng để tiết kiệm)
-            for i in tqdm(range(train_len), desc=f"Train-train ({alg}) [run {run_idx+1}]"):
-                X_computed[i, i] = 0.0
-                for j in range(i + 1, train_len):
-                    d = _pair_distance(X_train[i], X_train[j])
-                    X_computed[i, j] = d
-                    X_computed[j, i] = d
-    
-            # 5. Tính test–train distance
-            for i in tqdm(range(test_len), desc=f"Test-train ({alg}) [run {run_idx+1}]"):
-                for j in range(train_len):
-                    X_test_computed[i, j] = _pair_distance(X_test[i], X_train[j])
-
-        # 6. Chạy kNN với nhiều k, lấy best accuracy
-        k_list = sorted(set(num_neighbor_list))
-        accuracies = {}
-        best_acc = np.nan
-        best_k = None
-
-        for k in k_list:
-            if k > train_len:
-                print(f"Skip k={k} (n_train={train_len} < k)")
-                continue
-
-            clf = neighbors.KNeighborsClassifier(n_neighbors=k, metric="precomputed")
-            clf.fit(X_computed, y_train)
-            y_pred = clf.predict(X_test_computed)
-            acc = 100.0 * accuracy_score(y_test, y_pred)
-            accuracies[k] = acc
-            print(f"[Run {run_idx+1}] Accuracy of {k}NN: {acc:.2f} %")
-
-            if (best_k is None) or (acc > best_acc):
-                best_acc = acc
-                best_k = k
-
-        if best_k is None:
-            best_acc = np.nan
-
-        print(f"[Run {run_idx+1}] Best accuracy: {best_acc:.2f} % (k={best_k})")
-
-        # 7. Tính MAP theo định nghĩa trong paper
-        #    Nếu muốn fix k=1 như paper, đổi k_map = 1.
-        k_map = best_k if best_k is not None else 1
-        map_score = compute_map_knn_precomputed(
-            X_computed, X_test_computed, y_train, y_test, k=k_map
+        model_otsw = build_otsw_tamle(
+            sequences,
+            lam_time=lam_time,
+            leaf_size=leaf_size,
+            max_depth=max_depth,
+            seed=current_seed,
+            k_split=k_split,
         )
-        print(f"[Run {run_idx+1}] Mean Average Precision (MAP) with k={k_map}: {map_score:.2f} %")
-
-        # 8. Thời gian chạy lần này
-        runtime_s = time.time() - t0
-        print(f"[Run {run_idx+1}] Runtime: {runtime_s:.2f} s")
-
-        # Lưu lại
-        acc_list.append(best_acc)
-        map_list.append(map_score)
-        time_list.append(runtime_s)
-
-    # ====== Sau num_runs lần, tính mean và variance ======
-    acc_mean = float(np.mean(acc_list))
-    acc_var = float(np.var(acc_list))      # nếu muốn sample variance: np.var(..., ddof=1)
-    map_mean = float(np.mean(map_list))
-    map_var = float(np.var(map_list))
-    time_mean = float(np.mean(time_list))
-    time_var = float(np.var(time_list))
-
-    print("\n========== Summary over runs ==========")
-    print(f"Accuracy: mean={acc_mean:.2f} %, var={acc_var:.4f}")
-    print(f"MAP     : mean={map_mean:.2f} %, var={map_var:.4f}")
-    print(f"Runtime : mean={time_mean:.2f} s, var={time_var:.4f}")
-
-    # 9. Ghi ra Excel: dataset, accuracy_mean, accuracy_var, map_mean, map_var, runtime_mean, runtime_var
-    dataset_key = f"{datapath}_{datatype}"
-    out_file = f"{alg}.xlsx"
-    cols = [
-        "dataset",
-        "accuracy_mean", "accuracy_var",
-        "map_mean", "map_var",
-        "runtime_mean", "runtime_var",
-    ]
+        
+        M_edge_mass = model_otsw.M  # (E, m_total)
+        w = model_otsw.w.reshape(-1, 1)  # (E, 1)
+        
+        # Test-train distances
+        for i in range(test_len):
+            dist_all = (w * np.abs(M_edge_mass[:, i:i+1] - M_edge_mass)).sum(axis=0)
+            dist_accumulator[i, :] += dist_all[test_len : test_len + train_len]
+        
+        # Train-train distances
+        for i in range(train_len):
+            idx_i = test_len + i
+            dist_all = (w * np.abs(M_edge_mass[:, idx_i:idx_i+1] - M_edge_mass)).sum(axis=0)
+            train_dist_accumulator[i, :] += dist_all[test_len : test_len + train_len]
     
-    new_row = {
-        "dataset": dataset_key,
-        "accuracy_mean": acc_mean,
-        "accuracy_var": acc_var,
-        "map_mean": map_mean,
-        "map_var": map_var,
-        "runtime_mean": time_mean,
-        "runtime_var": time_var,
-    }
+    X_test_computed = dist_accumulator / num_trees
+    X_computed = train_dist_accumulator / num_trees
+    
+    # Run k-NN
+    clf = neighbors.KNeighborsClassifier(n_neighbors=k_nn, metric="precomputed")
+    clf.fit(X_computed, y_train)
+    y_pred = clf.predict(X_test_computed)
+    acc = 100.0 * accuracy_score(y_test, y_pred)
+    
+    # Compute MAP
+    map_score = compute_map_knn_precomputed(X_computed, X_test_computed, y_train, y_test, k=k_nn)
+    
+    time_total = time.time() - start_time
+    
+    return acc, map_score, time_total
 
-    if os.path.exists(out_file):
-        try:
-            df = pd.read_excel(out_file, engine="openpyxl")
-        except Exception:
-            df = pd.read_excel(out_file)
 
-        if "dataset" not in df.columns:
-            df.insert(0, "dataset", "")
+def run_knn_ablation_for_param(
+    X_train, y_train, X_test, y_test,
+    param_name, param_values, num_runs=5, **fixed_params
+):
+    """
+    Run ablation study for a single parameter with multiple runs.
+    Returns: DataFrame with columns [param_value, Accuracy_mean, Accuracy_std, MAP_mean, MAP_std, Time_mean, Time_std]
+    """
+    results = []
+    
+    print(f"\n{'='*60}")
+    print(f"Ablation Study (k-NN): {param_name}")
+    print(f"Testing {len(param_values)} values: {param_values}")
+    print(f"Number of runs per value: {num_runs}")
+    print(f"Fixed params: {fixed_params}")
+    print(f"{'='*60}")
+    
+    for val in param_values:
+        params = fixed_params.copy()
+        params[param_name] = val
+        
+        print(f"  Testing {param_name}={val}...")
+        
+        acc_runs = []
+        map_runs = []
+        time_runs = []
+        
+        for run_idx in range(num_runs):
+            try:
+                # Use different seed for each run
+                params_with_seed = params.copy()
+                params_with_seed['seed'] = ABLATION_BASE_SEED + run_idx * 100
+                
+                acc, map_score, time_total = run_knn_ablation_single(
+                    X_train, y_train, X_test, y_test, **params_with_seed
+                )
+                acc_runs.append(acc)
+                map_runs.append(map_score)
+                time_runs.append(time_total)
+                print(f"    Run {run_idx+1}/{num_runs}: ACC={acc:.2f}%, MAP={map_score:.2f}%, Time={time_total:.2f}s")
+            except Exception as e:
+                print(f"    Run {run_idx+1}/{num_runs}: ERROR: {e}")
+                acc_runs.append(np.nan)
+                map_runs.append(np.nan)
+                time_runs.append(np.nan)
+        
+        # Calculate mean and std
+        acc_mean = float(np.nanmean(acc_runs))
+        acc_std = float(np.nanstd(acc_runs))
+        map_mean = float(np.nanmean(map_runs))
+        map_std = float(np.nanstd(map_runs))
+        time_mean = float(np.nanmean(time_runs))
+        time_std = float(np.nanstd(time_runs))
+        
+        print(f"    => Mean: ACC={acc_mean:.2f}±{acc_std:.2f}%, MAP={map_mean:.2f}±{map_std:.2f}%, Time={time_mean:.2f}±{time_std:.2f}s")
+        
+        results.append({
+            param_name: val,
+            "Accuracy_mean": acc_mean,
+            "Accuracy_std": acc_std,
+            "MAP_mean": map_mean,
+            "MAP_std": map_std,
+            "Time_mean": time_mean,
+            "Time_std": time_std,
+        })
+    
+    return pd.DataFrame(results)
 
-        mask = (df["dataset"] == dataset_key)
-        if mask.any():
-            for c in cols:
-                df.loc[mask, c] = new_row[c]
-        else:
-            df = pd.concat(
-                [df, pd.DataFrame([new_row], columns=cols)],
-                ignore_index=True
-            )
+
+def plot_knn_ablation_results(df, param_name, save_dir="."):
+    """
+    Plot ablation results: Accuracy, MAP, and Time vs parameter value with error bars (std).
+    Saves directly to the specified directory (default: current directory).
+    For lam_time, tick labels show sqrt(value) since the code applies sqrt internally.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    # For lam_time: display sqrt(value) as label (code uses sqrt(lam_time) internally)
+    if param_name == "lam_time":
+        x = [f"{v**0.5:.4g}" for v in df[param_name]]
+        display_name = "λ (= √lam_time)"
     else:
-        df = pd.DataFrame([new_row], columns=cols)
+        x = df[param_name].astype(str).tolist()
+        display_name = param_name
+    x_numeric = range(len(x))
+    
+    # Plot Accuracy with error bars
+    axes[0].errorbar(x_numeric, df["Accuracy_mean"], yerr=df["Accuracy_std"], 
+                     marker='o', linewidth=2, markersize=8, color='blue', 
+                     capsize=4, capthick=1.5, elinewidth=1.5)
+    axes[0].set_xlabel(display_name, fontsize=12)
+    axes[0].set_ylabel("Accuracy (%)", fontsize=12)
+    axes[0].set_title(f"Accuracy vs {display_name}", fontsize=14)
+    axes[0].set_xticks(x_numeric)
+    axes[0].set_xticklabels(x, rotation=45, ha='right')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Plot MAP with error bars
+    axes[1].errorbar(x_numeric, df["MAP_mean"], yerr=df["MAP_std"], 
+                     marker='s', linewidth=2, markersize=8, color='green',
+                     capsize=4, capthick=1.5, elinewidth=1.5)
+    axes[1].set_xlabel(display_name, fontsize=12)
+    axes[1].set_ylabel("MAP (%)", fontsize=12)
+    axes[1].set_title(f"MAP vs {display_name}", fontsize=14)
+    axes[1].set_xticks(x_numeric)
+    axes[1].set_xticklabels(x, rotation=45, ha='right')
+    axes[1].grid(True, alpha=0.3)
+    
+    # Plot Time with error bars
+    axes[2].errorbar(x_numeric, df["Time_mean"], yerr=df["Time_std"], 
+                     marker='^', linewidth=2, markersize=8, color='red',
+                     capsize=4, capthick=1.5, elinewidth=1.5)
+    axes[2].set_xlabel(display_name, fontsize=12)
+    axes[2].set_ylabel("Time (seconds)", fontsize=12)
+    axes[2].set_title(f"Execution Time vs {display_name}", fontsize=14)
+    axes[2].set_xticks(x_numeric)
+    axes[2].set_xticklabels(x, rotation=45, ha='right')
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save figure directly in save_dir
+    fig_path = os.path.join(save_dir, f"ablation_knn_{param_name}.png")
+    plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    print(f"✅ Plot saved to {fig_path}")
+    return fig_path
 
-    df = df[cols]
-    df.to_excel(out_file, index=False, engine="openpyxl")
 
-    # Trả về cho code bên ngoài dùng nếu cần
-    return {
-        "accuracy_mean": acc_mean,
-        "accuracy_var": acc_var,
-        "map_mean": map_mean,
-        "map_var": map_var,
-        "runtime_mean": time_mean,
-        "runtime_var": time_var,
-        "acc_runs": acc_list,
-        "map_runs": map_list,
-        "time_runs": time_list,
-    }
+# Number of runs for ablation study
+ABLATION_NUM_RUNS = 5
+
+
+def run_full_knn_ablation_study(
+    dataset_name=ABLATION_DATASET,
+    datatype=ABLATION_DATATYPE,
+    save_dir=".",
+    num_runs=ABLATION_NUM_RUNS,
+):
+    """
+    Run complete ablation study for all OTSW parameters measuring k-NN performance.
+    Each parameter configuration is run num_runs times (default: 5) to compute mean and std.
+    Results are saved directly in save_dir (default: current directory).
+    """
+    print(f"\n{'#'*70}")
+    print(f"# OTSW ABLATION STUDY (k-NN) ON DATASET: {dataset_name}")
+    print(f"{'#'*70}")
+    
+    # Load dataset
+    if datatype == "UCR_TSL":
+        X_train, y_train, X_test, y_test = load_ucr_dataset_tsl("../data/UCR", dataset_name)
+    elif datatype == "Human_Actions":
+        X_train, y_train, X_test, y_test = load_human_action_dataset("../data/Human_Actions", dataset_name)
+    else:
+        raise ValueError(f"Unknown datatype: {datatype}")
+    
+    print(f"\nDataset: {dataset_name}")
+    print(f"Train samples: {len(y_train)}, Test samples: {len(y_test)}")
+    print(f"\nDefault parameters:")
+    print(f"  - Lambda (lam_time): {ABLATION_DEFAULT_LAMBDA}")
+    print(f"  - Max Depth: {ABLATION_DEFAULT_DEPTH}")
+    print(f"  - Number of Trees: {ABLATION_DEFAULT_TREES}")
+    print(f"  - Number of Clusters (k_split): {ABLATION_DEFAULT_NUM_CLUSTER}")
+    print(f"  - Number of runs per config: {num_runs}")
+    
+    all_results = {}
+    
+    
+    # 1. Ablation on Lambda (lam_time)
+    print("\n" + "="*70)
+    print("1. ABLATION ON LAMBDA (lam_time)")
+    print("="*70)
+    df_lambda = run_knn_ablation_for_param(
+        X_train, y_train, X_test, y_test,
+        param_name="lam_time",
+        param_values=ABLATION_LAMBDA_VALUES,
+        num_runs=num_runs,
+        max_depth=ABLATION_DEFAULT_DEPTH,
+        num_trees=ABLATION_DEFAULT_TREES,
+        k_split=ABLATION_DEFAULT_NUM_CLUSTER,
+    )
+    df_lambda.to_csv(os.path.join(save_dir, "ablation_knn_lambda.csv"), index=False)
+    plot_knn_ablation_results(df_lambda, "lam_time", save_dir)
+    all_results["lambda"] = df_lambda
+    '''
+    # 2. Ablation on Max Depth
+    print("\n" + "="*70)
+    print("2. ABLATION ON MAX DEPTH")
+    print("="*70)
+    df_depth = run_knn_ablation_for_param(
+        X_train, y_train, X_test, y_test,
+        param_name="max_depth",
+        param_values=ABLATION_DEPTH_VALUES,
+        num_runs=num_runs,
+        lam_time=ABLATION_DEFAULT_LAMBDA,
+        num_trees=ABLATION_DEFAULT_TREES,
+        k_split=ABLATION_DEFAULT_NUM_CLUSTER,
+    )
+    df_depth.to_csv(os.path.join(save_dir, "ablation_knn_depth.csv"), index=False)
+    plot_knn_ablation_results(df_depth, "max_depth", save_dir)
+    all_results["depth"] = df_depth
+    
+    # 3. Ablation on Number of Trees
+    print("\n" + "="*70)
+    print("3. ABLATION ON NUMBER OF TREES")
+    print("="*70)
+    df_trees = run_knn_ablation_for_param(
+        X_train, y_train, X_test, y_test,
+        param_name="num_trees",
+        param_values=ABLATION_TREES_VALUES,
+        num_runs=num_runs,
+        lam_time=ABLATION_DEFAULT_LAMBDA,
+        max_depth=ABLATION_DEFAULT_DEPTH,
+        k_split=ABLATION_DEFAULT_NUM_CLUSTER,
+    )
+    df_trees.to_csv(os.path.join(save_dir, "ablation_knn_trees.csv"), index=False)
+    plot_knn_ablation_results(df_trees, "num_trees", save_dir)
+    all_results["trees"] = df_trees
+    '''
+    # 4. Ablation on Number of Clusters (k_split)
+    print("\n" + "="*70)
+    print("4. ABLATION ON NUMBER OF CLUSTERS (k_split)")
+    print("="*70)
+    df_cluster = run_knn_ablation_for_param(
+        X_train, y_train, X_test, y_test,
+        param_name="k_split",
+        param_values=ABLATION_NUM_CLUSTER_VALUES,
+        num_runs=num_runs,
+        lam_time=ABLATION_DEFAULT_LAMBDA,
+        max_depth=ABLATION_DEFAULT_DEPTH,
+        num_trees=ABLATION_DEFAULT_TREES,
+    )
+    df_cluster.to_csv(os.path.join(save_dir, "ablation_knn_cluster.csv"), index=False)
+    plot_knn_ablation_results(df_cluster, "k_split", save_dir)
+    all_results["cluster"] = df_cluster
+
+    # Summary
+    print("\n" + "#"*70)
+    print("# ABLATION STUDY (k-NN) COMPLETE")
+    print("#"*70)
+    print(f"\nResults saved to {save_dir}:")
+    print("  - ablation_knn_lambda.csv + ablation_knn_lam_time.png")
+    print("  - ablation_knn_depth.csv + ablation_knn_max_depth.png")
+    print("  - ablation_knn_trees.csv + ablation_knn_num_trees.png")
+    print("  - ablation_knn_cluster.csv + ablation_knn_k_split.png")
+    
+    return all_results
+
+
+# ---------------------- Usage ----------------------
+# Run the full ablation study (5 runs per config by default):
+all_results = run_full_knn_ablation_study(dataset_name="ItalyPowerDemand", datatype="UCR_TSL", save_dir=".", num_runs=1)
+#
+# Or run individual parameter ablations:
+#   X_train, y_train, X_test, y_test = load_ucr_dataset_tsl("../data/UCR", "BasicMotions")
+#   df_lambda = run_knn_ablation_for_param(X_train, y_train, X_test, y_test, "lam_time", ABLATION_LAMBDA_VALUES, num_runs=5, max_depth=30, num_trees=5, k_split=2)
+#
+# CSV output columns: param_value, Accuracy_mean, Accuracy_std, MAP_mean, MAP_std, Time_mean, Time_std
