@@ -179,8 +179,8 @@ class OTSWModel:
 # =========================
 def _route_all_points_vectorized(model: OTSWModel) -> np.ndarray:
     """
-    Route mọi điểm xuống lá bằng cách so khoảng cách Euclid tới centroid của các con (k-ary).
-    (Lưu ý: dùng Euclid cho routing; d_tau đã dùng khi split/cluster centers.)
+    Route mọi điểm xuống lá bằng cách so khoảng cách d_tau tới centroid của các con (k-ary).
+    (Dùng cùng độ đo lai như khi split/cluster centers.)
     """
     N = model.P.shape[0]
     leaf_of_point = np.empty(N, dtype=np.int32)
@@ -201,7 +201,8 @@ def _route_all_points_vectorized(model: OTSWModel) -> np.ndarray:
         # k-ary routing: tìm child có centroid gần nhất
         children = nd.children
         X = P[idxs]
-        dists = np.stack([np.linalg.norm(X - C[c], axis=1) for c in children], axis=1)  # (n, k)
+        child_centroids = C[children]  # (k, d_aug)
+        dists = _pairwise_sqdist(X, child_centroids)  # (n, k)
         assignments = np.argmin(dists, axis=1)  # (n,)
         for ci, child_nid in enumerate(children):
             mask = (assignments == ci)
@@ -294,9 +295,9 @@ def build_otsw_tamle(
     nodes: List[_Node] = []
     leaf_ids: List[int] = []
 
-    def _euclid_radius(X: np.ndarray) -> float:
+    def _hybrid_radius(X: np.ndarray) -> float:
         """
-        Bán kính xấp xỉ để làm height: 0.5 * max distance tới 1 điểm farthest (heuristic)
+        Bán kính xấp xỉ để làm height: 0.5 * max d_tau tới 1 điểm farthest (heuristic)
         """
         if X.shape[0] <= 1:
             return 0.0
@@ -306,14 +307,14 @@ def build_otsw_tamle(
         else:
             Y = X
         j0 = 0
-        d0 = np.linalg.norm(Y - Y[j0], axis=1)
+        d0 = _pairwise_sqdist(Y, Y[j0:j0 + 1]).reshape(-1)
         j1 = int(np.argmax(d0))
-        d1 = np.linalg.norm(Y - Y[j1], axis=1)
+        d1 = _pairwise_sqdist(Y, Y[j1:j1 + 1]).reshape(-1)
         return 0.5 * float(d1.max())
 
     def build(idx: np.ndarray, depth: int, parent: Optional[int], seed_: int) -> int:
         Xsub = P_aug[idx]
-        h = _euclid_radius(Xsub)
+        h = _hybrid_radius(Xsub)
 
         nid = len(nodes)
         nodes.append(_Node(idx=idx, height=h, children=[], parent=parent, is_leaf=False))
